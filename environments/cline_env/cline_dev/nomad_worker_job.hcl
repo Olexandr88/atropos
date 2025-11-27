@@ -55,7 +55,6 @@ variable "atropos_root" {
 }
 
 job "cline-worker" {
-  name        = var.job_name
   datacenters = ["dc1"]
   type        = "batch"
 

@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CLINE_SRC_DIR=${CLINE_SRC_DIR:-/tmp/nous-cline}
 CLINE_REPO_URL=${CLINE_REPO_URL:-https://github.com/NousResearch/cline}
+# Use the cline submodule from atropos repo if available
+CLINE_SUBMODULE_DIR="${ATROPOS_ROOT:-$ROOT_DIR/../..}/environments/cline_env/cline"
 WORKSPACE_ROOT=${WORKSPACE_ROOT:-/workspace}
 TASK_BOOTSTRAP_SCRIPT=${TASK_BOOTSTRAP_SCRIPT:-}
 PROTOBUS_PORT=${PROTOBUS_PORT:-26040}
@@ -16,10 +18,25 @@ log() {
 }
 
 fetch_cline_repo() {
+  # Check if we can use the pre-built cline submodule (much faster)
+  if [[ -d "$CLINE_SUBMODULE_DIR/dist-standalone" ]]; then
+    log "Using pre-built Cline from submodule at $CLINE_SUBMODULE_DIR"
+    # Use the submodule directly - no need to copy
+    CLINE_SRC_DIR="$CLINE_SUBMODULE_DIR"
+    export CLINE_SRC_DIR
+    return 0
+  fi
+
+  log "Pre-built Cline not found, falling back to clone/build"
+  
+  # Skip git-lfs to avoid "command not found" errors - LFS files not needed for build
+  export GIT_LFS_SKIP_SMUDGE=1
+  
   if [[ -d "$CLINE_SRC_DIR/.git" ]]; then
     log "Updating existing Cline repo at $CLINE_SRC_DIR"
     git -C "$CLINE_SRC_DIR" fetch origin main
-    git -C "$CLINE_SRC_DIR" checkout main
+    # Clean untracked files and reset before checkout to avoid conflicts
+    git -C "$CLINE_SRC_DIR" clean -fd
     git -C "$CLINE_SRC_DIR" reset --hard origin/main
   else
     log "Cloning $CLINE_REPO_URL into $CLINE_SRC_DIR"
@@ -48,6 +65,12 @@ apply_cline_patches() {
 }
 
 build_cline() {
+  # Skip build if using pre-built submodule
+  if [[ -d "$CLINE_SRC_DIR/dist-standalone" ]]; then
+    log "Using pre-built Cline standalone at $CLINE_SRC_DIR/dist-standalone"
+    return 0
+  fi
+  
   pushd "$CLINE_SRC_DIR" >/dev/null
   log "Installing npm dependencies"
   npm install
@@ -84,11 +107,24 @@ start_cline_core() {
   export CLINE_DISABLE_REMOTE_CONFIG=true
   export E2E_TEST=true
   export CLINE_ENVIRONMENT=local
+  export PROJECT_ROOT="$CLINE_SRC_DIR"
 
-  log "Launching Cline core in $WORKSPACE_DIR"
-  pushd "$CLINE_SRC_DIR" >/dev/null
-  npx tsx scripts/test-standalone-core-api-server.ts
-  popd >/dev/null
+  log "Launching Cline core in $WORKSPACE_DIR (using production server, no mock API)"
+  
+  # Use our custom server script that doesn't start ClineApiServerMock on port 7777
+  # This allows multiple workers to run in parallel without port conflicts
+  CUSTOM_SERVER="${ATROPOS_ROOT:-$ROOT_DIR/../..}/environments/cline_env/cline_dev/cline_core_server.ts"
+  if [[ -f "$CUSTOM_SERVER" ]]; then
+    log "Using custom server script: $CUSTOM_SERVER"
+    pushd "$CLINE_SRC_DIR" >/dev/null
+    npx tsx "$CUSTOM_SERVER"
+    popd >/dev/null
+  else
+    log "Custom server not found, falling back to test server"
+    pushd "$CLINE_SRC_DIR" >/dev/null
+    npx tsx scripts/test-standalone-core-api-server.ts
+    popd >/dev/null
+  fi
 }
 
 main() {

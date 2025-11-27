@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -130,15 +131,23 @@ class LocalWorkerManager:
 
     def stop(self, handle: WorkerHandle, timeout: float = 20.0) -> None:
         proc = handle.process
-        if proc is None or proc.poll() is not None:
-            return
-        logger.info("Stopping local Cline worker %s", handle.worker_id)
-        proc.terminate()
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            logger.warning("Worker %s did not terminate gracefully; killing", handle.worker_id)
-            proc.kill()
+        if proc is not None and proc.poll() is None:
+            logger.info("Stopping local Cline worker %s", handle.worker_id)
+            proc.terminate()
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                logger.warning("Worker %s did not terminate gracefully; killing", handle.worker_id)
+                proc.kill()
+
+        # Clean up temporary directories
+        for path in [handle.cline_src_dir, handle.workspace_root]:
+            if path and path.exists():
+                try:
+                    shutil.rmtree(path)
+                    logger.info("Cleaned up directory: %s", path)
+                except Exception as e:
+                    logger.warning("Failed to clean up %s: %s", path, e)
 
 
 class NomadWorkerManager:
@@ -167,15 +176,15 @@ class NomadWorkerManager:
         """Query Nomad for dynamically allocated ports."""
         status_output = self._run_nomad_cmd(["nomad", "alloc", "status", "-json", allocation_id])
         status_data = json.loads(status_output)
-        
+
         # Extract dynamic ports from allocation
         resources = status_data.get("AllocatedResources", {})
         shared = resources.get("Shared", {})
         networks = shared.get("Networks", [])
-        
+
         protobus_port = None
         hostbridge_port = None
-        
+
         for network in networks:
             dyn_ports = network.get("DynamicPorts", [])
             for port_info in dyn_ports:
@@ -183,10 +192,10 @@ class NomadWorkerManager:
                     protobus_port = port_info.get("Value")
                 elif port_info.get("Label") == "hostbridge":
                     hostbridge_port = port_info.get("Value")
-        
+
         if not protobus_port or not hostbridge_port:
             raise RuntimeError(f"Could not find dynamic ports in allocation {allocation_id}")
-        
+
         return protobus_port, hostbridge_port
 
     def start_for_profile(self, profile_key: str, task_env: Dict[str, str]) -> WorkerHandle:
@@ -207,7 +216,8 @@ class NomadWorkerManager:
         workspace_root = Path(task_env.get("WORKSPACE_ROOT", tempfile.mkdtemp(prefix=f"cline-{worker_id}-")))
         workspace_root.mkdir(parents=True, exist_ok=True)
 
-        cline_src_dir = Path(task_env.get("CLINE_SRC_DIR", "/tmp/nous-cline-worker"))
+        # Use unique CLINE_SRC_DIR per worker to avoid git conflicts
+        cline_src_dir = Path(task_env.get("CLINE_SRC_DIR", f"/tmp/nous-cline-{worker_id}"))
 
         # Prepare Nomad job variables
         anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -230,30 +240,63 @@ class NomadWorkerManager:
             "atropos_root": str(self.atropos_root),
         }
 
-        # Submit Nomad job
+        # Generate HCL with dynamic job name (Nomad HCL doesn't support variables in job ID)
+        hcl_content = self.job_hcl.read_text()
+        hcl_content = hcl_content.replace('job "cline-worker"', f'job "{job_name}"')
+
+        # Submit Nomad job via stdin with modified HCL
         args = ["nomad", "job", "run"]
         for key, value in job_vars.items():
             args.extend(["-var", f"{key}={value}"])
-        args.append(str(self.job_hcl))
+        args.append("-")  # Read from stdin
 
         logger.info("Submitting Nomad job %s for profile %s", job_name, profile_key)
-        output = self._run_nomad_cmd(args)
-        logger.debug("Nomad job submitted: %s", output[:500])
+        try:
+            env = os.environ.copy()
+            env["NOMAD_ADDR"] = self.nomad_address
+            result = subprocess.run(
+                args, env=env, input=hcl_content, capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Nomad job submission failed: {result.stderr.strip()}")
+            output = result.stdout
+            logger.info("Nomad job %s submitted successfully", job_name)
+            logger.debug("Nomad job output: %s", output[:500])
+        except RuntimeError as e:
+            logger.error("Failed to submit Nomad job %s: %s", job_name, e)
+            raise
 
-        # Parse allocation ID from output
+        # Get allocation ID by querying the job's allocations
+        # This is more reliable than parsing the job run output
         allocation_id = None
-        for line in output.splitlines():
-            if "Allocation" in line and "created" in line:
-                cleaned = line.replace('"', "")
-                parts = cleaned.split()
-                if "Allocation" in parts:
-                    idx = parts.index("Allocation")
-                    if idx + 1 < len(parts):
-                        allocation_id = parts[idx + 1]
+        alloc_deadline = time.time() + 60.0  # Increased timeout
+        attempt = 0
+        while time.time() < alloc_deadline:
+            attempt += 1
+            try:
+                alloc_output = self._run_nomad_cmd(["nomad", "job", "allocs", "-json", job_name])
+                allocs = json.loads(alloc_output)
+                if allocs and len(allocs) > 0:
+                    # Get the most recent allocation
+                    allocation_id = allocs[0].get("ID")
+                    if allocation_id:
+                        logger.info("Found allocation %s for job %s on attempt %d", allocation_id, job_name, attempt)
                         break
+                else:
+                    if attempt <= 3 or attempt % 10 == 0:
+                        logger.debug("No allocations yet for job %s (attempt %d)", job_name, attempt)
+            except Exception as e:
+                logger.warning("Error querying allocations for job %s: %s", job_name, e)
+            time.sleep(1.0)
 
         if not allocation_id:
-            raise RuntimeError(f"Could not parse allocation ID from Nomad output")
+            # Try to get job status to understand what happened
+            try:
+                status_output = self._run_nomad_cmd(["nomad", "job", "status", "-json", job_name])
+                logger.error("Job %s status: %s", job_name, status_output[:500])
+            except Exception as e:
+                logger.error("Could not get status for job %s: %s", job_name, e)
+            raise RuntimeError(f"Could not get allocation ID for job {job_name}")
 
         # Wait for allocation to be running
         deadline = time.time() + 300.0
@@ -275,8 +318,12 @@ class NomadWorkerManager:
 
         # Get dynamically allocated ports
         protobus_port, hostbridge_port = self._get_allocation_ports(allocation_id)
-        logger.info("Worker %s got dynamic ports: protobus=%d, hostbridge=%d", 
-                    worker_id, protobus_port, hostbridge_port)
+        logger.info(
+            "Worker %s got dynamic ports: protobus=%d, hostbridge=%d",
+            worker_id,
+            protobus_port,
+            hostbridge_port,
+        )
 
         # Wait for protobus port to be ready
         _wait_for_port("127.0.0.1", protobus_port, timeout=600.0)
@@ -300,6 +347,15 @@ class NomadWorkerManager:
             logger.info("Nomad job %s stopped", handle.nomad_job_id)
         except Exception as e:
             logger.warning("Failed to stop Nomad job %s: %s", handle.nomad_job_id, e)
+
+        # Clean up temporary directories
+        for path in [handle.cline_src_dir, handle.workspace_root]:
+            if path and path.exists():
+                try:
+                    shutil.rmtree(path)
+                    logger.info("Cleaned up directory: %s", path)
+                except Exception as e:
+                    logger.warning("Failed to clean up %s: %s", path, e)
 
 
 def get_worker_manager(

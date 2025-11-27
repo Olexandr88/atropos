@@ -161,7 +161,9 @@ class ClineAgentEnv(BaseEnv):
             max_attempts = 3
             backoff_s = 1.0
             for attempt in range(1, max_attempts + 1):
-                assistant_content, cline_metadata = self._run_cline_worker(
+                # Run the blocking worker in a thread to allow parallel workers
+                assistant_content, cline_metadata = await asyncio.to_thread(
+                    self._run_cline_worker,
                     profile_config, item, issue_text
                 )
                 if assistant_content or cline_metadata is not None:
@@ -357,14 +359,22 @@ class ClineAgentEnv(BaseEnv):
         handle = manager.start_for_profile(profile_config.profile_key, task_env)
 
         try:
+            # Look for descriptor_set.pb in multiple locations:
+            # 1. Worker's CLINE_SRC_DIR (if clone/build was used)
+            # 2. Pre-built submodule directory (faster, preferred)
+            atropos_root = Path(__file__).resolve().parent.parent.parent
+            submodule_dir = atropos_root / "environments" / "cline_env" / "cline"
+            
             descriptor_candidates = [
                 handle.cline_src_dir / "dist-standalone" / "proto" / "descriptor_set.pb",
                 handle.cline_src_dir / "proto" / "descriptor_set.pb",
+                submodule_dir / "dist-standalone" / "proto" / "descriptor_set.pb",
+                submodule_dir / "proto" / "descriptor_set.pb",
             ]
             descriptor_path = next((p for p in descriptor_candidates if p.exists()), None)
             if descriptor_path is None:
                 raise FileNotFoundError(
-                    f"descriptor_set.pb not found under {handle.cline_src_dir}"
+                    f"descriptor_set.pb not found under {handle.cline_src_dir} or {submodule_dir}"
                 )
 
             descriptor_bytes = descriptor_path.read_bytes()
@@ -531,6 +541,14 @@ class ClineAgentEnv(BaseEnv):
                 raise TimeoutError(
                     "Timed out waiting to subscribe to Cline UiService partial messages"
                 )
+
+            # Cancel any existing task first to avoid "Task locked" errors
+            try:
+                cancel_req = new_message("cline.EmptyRequest")
+                unary_unary("/cline.TaskService/cancelTask", cancel_req, "cline.Empty")
+                logger.debug("Cancelled any existing task before starting new one")
+            except Exception as e:
+                logger.debug("cancelTask call failed (may be no task to cancel): %s", e)
 
             # Create a new task.
             metadata_msg = new_message("cline.Metadata")
